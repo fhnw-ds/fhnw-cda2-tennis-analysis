@@ -25,7 +25,7 @@ class DataPipeline:
 
 
     @staticmethod
-    def findValidObject_ids(data, framesToBeReached):
+    def findValidObjectIds(data, framesToBeReached):
         """Finds all object_ids that are seen in more than x frames
 
         Args:
@@ -40,7 +40,7 @@ class DataPipeline:
         return listOfObject_ids
 
     @staticmethod
-    def overwriteObject_ids(data, playerIdOne, playerIdTwo):
+    def overwriteObjectIds(data, playerIdOne, playerIdTwo):
         data.loc[data['object_id'] == playerIdTwo, 'object_id'] = playerIdOne
         return data
 

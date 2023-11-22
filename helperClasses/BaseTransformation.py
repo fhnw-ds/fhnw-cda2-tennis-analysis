@@ -6,7 +6,7 @@ class BaseTransformation:
         self.global_points = global_points
 
     @staticmethod
-    def get_translation_funcs(global_points):
+    def getTranslationFuncs(global_points):
         """Transforms global points to court points
 
         Args:
@@ -64,7 +64,7 @@ class BaseTransformation:
 
 
 
-    def transform_Data(self, data, centralisation):
+    def transformData(self, data, centralisation):
         """Transforms x, y and z coordinates to court coordiantesystem
 
         Args:
