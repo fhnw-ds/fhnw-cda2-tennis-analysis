@@ -90,7 +90,7 @@ class BaseTransformation:
             transformed_data = base_transformation.transform_Data(data, centralisation)
 
         """
-        translation_func, rotation_func = self.get_translation_funcs(self.global_points)
+        translation_func, rotation_func = self.getTranslationFuncs(self.global_points)
         transformed_xyz = data[['x', 'y', 'z']].apply(lambda x: translation_func(x), axis=1)
         data['x'] = transformed_xyz.apply(lambda x: x[0] + centralisation[0])
         data['y'] = transformed_xyz.apply(lambda x: x[1] + centralisation[1])
