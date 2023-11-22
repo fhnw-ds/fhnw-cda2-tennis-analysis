@@ -11,7 +11,7 @@ class DataPipeline:
 
         """
 
-        dataBelowThreshold = data[~data['object_id'].isin(self.findValidObject_ids(data, framesToBeReached))]
+        dataBelowThreshold = data[~data['object_id'].isin(self.findValidObjectIds(data, framesToBeReached))]
         value_counts = dataBelowThreshold['object_id'].value_counts().to_frame().reset_index()
         pairs = []
         for i in range(len(value_counts)):
@@ -67,10 +67,10 @@ class DataPipeline:
         data = self.filterAtrifactIds(data, thresholdIds)
         frame_length = max(data['frame'])
         framesToBeReachedPerson = frame_length * thresholdPerson
-        validObject_ids = self.findValidObject_ids(data, framesToBeReachedPerson)
+        validObject_ids = self.findValidObjectIds(data, framesToBeReachedPerson)
         validPairs = self.findCombinations(data, framesToBeReachedPerson)
         for pair in validPairs:
-            data = self.overwriteObject_ids(data, pair[0], pair[1])
+            data = self.overwriteObjectIds(data, pair[0], pair[1])
             validObject_ids.append(pair[0])
 
         return data[data['object_id'].isin(validObject_ids)]
@@ -88,6 +88,6 @@ class DataPipeline:
         """
         frame_length = max(data['frame'])
         framesToBeReached = frame_length * threshold
-        validObject_ids = self.findValidObject_ids(data, framesToBeReached)
+        validObject_ids = self.findValidObjectIds(data, framesToBeReached)
         return data[data['object_id'].isin(validObject_ids)]
 
