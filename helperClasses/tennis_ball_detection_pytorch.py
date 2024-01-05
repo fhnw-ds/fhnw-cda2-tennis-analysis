@@ -14,16 +14,16 @@ class BallDetectionPytorch:
     def __init__(self, svo_path):
         self.svo_path = svo_path
         self.median_background_l = torch.tensor([]).to(device)
+        self.median_background_r = torch.tensor([]).to(device)
 
+    def get_ball_by_frame(self, frameFrom, frameTo, camera = 'left', return_video = False):
 
-
-    def get_ball_by_frame(self, frameFrom, frameTo, return_video = False):
-
-        """Returns the ball position in a frame of left camera
+        """Returns the ball position in a frame.
 
         Args:
             frameFrom (int): Frame to start from
             frameTo (int): Frame to end at
+            camera (str): Camera to use, standard: 'left'
             svo_path (str): Path to the svo file
             return_video (bool): Whether to return the video with the bounding box or just a list of ball positions, standard: False
 
@@ -36,7 +36,17 @@ class BallDetectionPytorch:
             ball_pos = get_ball_by_frame(0, 100, 'path/to/svo/file.svo', median_background_l, depth_background_l)
         """
 
-        tensor_median_background_l = self.median_background_l
+
+
+        camera_lens = sl.VIEW
+        if camera == 'left':
+            camera_lens = sl.VIEW.LEFT
+            tensor_median_background = self.median_background_l
+        elif camera == 'right':
+            camera_lens = sl.VIEW.RIGHT
+            tensor_median_background = self.median_background_r
+        else:
+            raise Exception('camera must be either left or right')
 
         zed = sl.Camera()
 
@@ -51,7 +61,7 @@ class BallDetectionPytorch:
 
         zed.open(init_params)
 
-        current_frame_left = sl.Mat()
+        current_frame = sl.Mat()
 
         # init detection parameters
         detection_parameters = sl.ObjectDetectionParameters()
@@ -82,41 +92,40 @@ class BallDetectionPytorch:
         for frame in tqdm(range(frameFrom, frameTo)):
             if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
                 # Get Images
-                zed.retrieve_image(current_frame_left, sl.VIEW.LEFT)
+                zed.retrieve_image(current_frame, camera_lens)
                 zed.retrieve_objects(detected_objects, detection_parameters_rt)
 
                 # Get Arrays
-                current_frame_left_data = current_frame_left.get_data()[:, :, :3]
-                tensor_current_frame_left_data = torch.from_numpy(current_frame_left_data).to(device)
+                current_frame_data = current_frame.get_data()[:, :, :3]
+                tensor_current_frame_data = torch.from_numpy(current_frame_data).to(device)
 
                 # Get Moving Pixels
-                tensor_moving_left = (tensor_current_frame_left_data - tensor_median_background_l).to(device)
+                tensor_moving = (tensor_current_frame_data - tensor_median_background).to(device)
+
 
                 # Get Tennis Ball Position
-                tensor_tennis_ball_pos = self.detect_tennis_ball(tensor_moving_left, detected_objects, tensor_current_frame_left_data).to(device)
+                tensor_tennis_ball_pos = self.detect_tennis_ball(tensor_moving, detected_objects, tensor_current_frame_data).to(device)
 
                 if not return_video:
                    list_of_ball_positions.append(tensor_tennis_ball_pos)
 
                 else:
-                    tensor_tennis_ball_bb = self.draw_bb(tensor_current_frame_left_data, tensor_tennis_ball_pos)
+                    tensor_tennis_ball_bb = self.draw_bb(tensor_current_frame_data, tensor_tennis_ball_pos)
                     tensor_frame_with_bb = tensor_tennis_ball_bb.clone()
                     tensor_mask = tensor_tennis_ball_bb != 255
-                    tensor_frame_with_bb[tensor_mask] = tensor_current_frame_left_data[tensor_mask]
+                    tensor_frame_with_bb[tensor_mask] = tensor_current_frame_data[tensor_mask]
                     video[:, :, :, frame - frameFrom] = tensor_frame_with_bb
 
         if return_video:
-            self.make_mp4(video)
+            self.make_mp4(video, camera)
             return video
         else:
-            #print(f'shape of list_of_ball_positions: {list_of_ball_positions.shape}')
             result_list = torch.cat(list_of_ball_positions, dim=0)
-            print(f'shape of result_list: {result_list.shape}')
             result_list = torch.reshape(result_list, (int(result_list.shape[0]/2), 2))
             return result_list
 
     @staticmethod
-    def make_mp4(video, bildrate = 20, auflösung = (1920, 1080)):
+    def make_mp4(video, camera, bildrate = 20, auflösung = (1920, 1080)):
         """
         Converts a video to a mp4 file.
 
@@ -128,7 +137,7 @@ class BallDetectionPytorch:
         """
         video_numpy = video.cpu().numpy()
         datestring = datetime.now().strftime("%Y-%m-%d-%H-%M")
-        filename = f'renderedVideo-{datestring}.mp4'
+        filename = f'renderedVideo-{datestring}_{camera}.mp4'
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec
         video_komplett = cv2.VideoWriter(filename, fourcc, 20, (1920, 1080))  # Bildrate und Auflösung
 
@@ -322,7 +331,7 @@ class BallDetectionPytorch:
         bb[tensor_center[0] - 15:tensor_center[0] + 15, tensor_center[1] - 15:tensor_center[1] + 15] = 255
         return bb
 
-    def calculate_background(self, svo_path, calibration_frames = 120, skip_frames = 30):
+    def calculate_background(self, svo_path, camera = 'left', calibration_frames = 120, skip_frames = 30):
         """
         Calculates the median background and the depth background of the left camera.
 
@@ -333,6 +342,15 @@ class BallDetectionPytorch:
         :return: The median background and the depth background of the left camera.
 
         """
+
+        camera_lens = sl.VIEW
+        if camera == 'left':
+            camera_lens = sl.VIEW.LEFT
+        elif camera == 'right':
+            camera_lens = sl.VIEW.RIGHT
+        else:
+            raise Exception('camera must be either left or right')
+
 
         svo_path = svo_path
         zed = sl.Camera()
@@ -349,33 +367,40 @@ class BallDetectionPytorch:
         zed.open(init_params)
 
         runtime_parameters = sl.RuntimeParameters()
-        temp_image_left = sl.Mat()
-        color_array_l = torch.zeros((1080, 1920, 3, calibration_frames)).to(device)
+        temp_image = sl.Mat()
+        color_array = torch.zeros((1080, 1920, 3, calibration_frames)).to(device)
         range_count = calibration_frames * skip_frames
         for i in tqdm(range(range_count)):
             if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
                 if i % skip_frames != 0:
                     continue
-                zed.retrieve_image(temp_image_left, sl.VIEW.LEFT)
-                current_frame_l = temp_image_left.get_data()[:, :, :3]
-                color_array_l[:, :, :, i // skip_frames] = torch.from_numpy(current_frame_l)
+                zed.retrieve_image(temp_image, camera_lens)
+                current_frame = temp_image.get_data()[:, :, :3]
+                color_array[:, :, :, i // skip_frames] = torch.from_numpy(current_frame)
 
         # get median depth
-        median_depth_l = color_array_l.nanmedian(3).values
-        self.median_background_l = median_depth_l
+        median_depth = color_array.nanmedian(3).values
+        if camera == 'left':
+            self.median_background_l = median_depth
+        else:
+            self.median_background_r = median_depth
         zed.close()
-        return median_depth_l
+        return median_depth
 
-    def save_background(self, path = 'median_background.pt'):
+    def save_background(self, camera = 'left', path = 'median_background'):
         '''
         Saves the median background of a video to a local file.
 
-        :param path (str): The path to the file. standard: 'median_background.pt'
+        :param path (str): The path to the file. standard: 'median_background'
         '''
+        if camera == 'left':
+            torch.save(self.median_background_l, path +'_l.pt')
+        elif camera == 'right':
+            torch.save(self.median_background_l, path +'_r.pt')
+        else:
+            raise Exception('camera must be either left or right')
 
-        torch.save(self.median_background_l, path)
-
-    def load_background(self, path = 'median_background.pt'):
+    def load_background(self, camera = 'left', path = 'median_background'):
         '''
         Loads the median background of a video from a local file.
 
@@ -384,6 +409,14 @@ class BallDetectionPytorch:
         :return: The median background.
         '''
 
-        self.median_background_l = torch.load(path)
-        return self.median_background_l
+        if camera == 'left':
+            self.median_background_l = torch.load(path +'_l.pt')
+            return self.median_background_l
+        elif camera == 'right':
+            self.median_background_r = torch.load(path +'_r.pt')
+            return self.median_background_r
+        else:
+            raise Exception('camera must be either left or right')
+
+
 
