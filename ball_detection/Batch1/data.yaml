@@ -1,0 +1,13 @@
+train: ./train/images
+val: ./valid/images
+test: ./test/images
+
+nc: 3
+names: ['person', 'tennis racket', 'tennisball']
+
+roboflow:
+  workspace: tennisball-detection
+  project: tennisball-t8tgi
+  version: 1
+  license: Public Domain
+  url: https://universe.roboflow.com/tennisball-detection/tennisball-t8tgi/dataset/1
