@@ -85,15 +85,21 @@ class BallDetectionPytorch:
         detected_objects = sl.Objects()
         runtime_parameters = sl.RuntimeParameters()
 
+        last_ball_position = torch.tensor([0, 0]).to(device)
+        last_picture = torch.zeros((1080, 1920, 3)).to(device)
+
         list_of_ball_positions = []
         video = torch.zeros((1080, 1920, 3, frameTo - frameFrom))
         zed.set_svo_position(frameFrom)
+        current_depth_frame = sl.Mat()
 
         for frame in tqdm(range(frameFrom, frameTo)):
             if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
                 # Get Images
                 zed.retrieve_image(current_frame, camera_lens)
                 zed.retrieve_objects(detected_objects, detection_parameters_rt)
+                zed.retrieve_measure(current_depth_frame, sl.MEASURE.DEPTH)
+
 
                 # Get Arrays
                 current_frame_data = current_frame.get_data()[:, :, :3]
@@ -104,8 +110,9 @@ class BallDetectionPytorch:
 
 
                 # Get Tennis Ball Position
-                tensor_tennis_ball_pos = self.detect_tennis_ball(tensor_moving, detected_objects, tensor_current_frame_data).to(device)
-
+                tensor_tennis_ball_pos = self.detect_tennis_ball(tensor_moving, detected_objects, tensor_current_frame_data, last_ball_position, last_picture).to(device)
+                last_ball_position = tensor_tennis_ball_pos.clone()
+                last_picture = tensor_current_frame_data.clone()
                 if not return_video:
                    list_of_ball_positions.append(tensor_tennis_ball_pos)
 
@@ -115,6 +122,8 @@ class BallDetectionPytorch:
                     tensor_mask = tensor_tennis_ball_bb != 255
                     tensor_frame_with_bb[tensor_mask] = tensor_current_frame_data[tensor_mask]
                     video[:, :, :, frame - frameFrom] = tensor_frame_with_bb
+            else:
+                print('Error')
 
         if return_video:
             self.make_mp4(video, camera)
@@ -136,6 +145,7 @@ class BallDetectionPytorch:
         :return: The converted video.
         """
         video_numpy = video.cpu().numpy()
+        video_numpy = video_numpy.astype(np.uint8)
         datestring = datetime.now().strftime("%Y-%m-%d-%H-%M")
         filename = f'renderedVideo-{datestring}_{camera}.mp4'
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec
@@ -143,7 +153,7 @@ class BallDetectionPytorch:
 
         # Bilder zum Video hinzufügen
         for bild in tqdm(range(video_numpy.shape[3])):
-            video_komplett.write(video_numpy[:, :, :, bild].astype(np.uint8))
+            video_komplett.write(video_numpy[:, :, :, bild])
 
         # Video speichern
         video_komplett.release()
@@ -244,7 +254,8 @@ class BallDetectionPytorch:
         windows = tensor_image.unfold(0, window_height, 1).unfold(1, window_width, 1)
 
         # Berechnung der Summe in jedem Fenster
-        tensor_window_sums = windows.sum(dim=[2, 3])
+        windows = windows.float()
+        tensor_window_sums = windows.mean(dim=[2, 3])
 
         return tensor_window_sums
 
@@ -274,7 +285,7 @@ class BallDetectionPytorch:
 
         return mask
 
-    def detect_tennis_ball(self, tensor_moving_pixels, detected_objects, tensor_original_picture):
+    def detect_tennis_ball(self, tensor_moving_pixels, detected_objects, tensor_original_picture, last_ball_position, previous_picture):
         """
         Detects the tennis ball in the image.
 
@@ -286,22 +297,33 @@ class BallDetectionPytorch:
         """
         tensor_original_picture_gpu = tensor_original_picture.to(device)
         tensor_moving_pixels_gpu = tensor_moving_pixels.to(device)
+        tensor_moving_pixels_relative_previous = (tensor_original_picture_gpu - previous_picture).to(device)
 
-
+        tensor_diff_pixels_relative_previous = torch.square(tensor_moving_pixels_relative_previous.type(torch.uint8)).sum(dim=2).to(device)
         tensor_diff_pixels = torch.square(tensor_moving_pixels_gpu.type(torch.uint8)).sum(dim=2).to(device)
         #diff_pixels = np.square(moving_pixels.astype(np.uint8)).sum(axis=2)
 
-        tensor_areaOfInterest = self.get_area_of_interest(tensor_diff_pixels, detected_objects).to(device)
+        tensor_final_diff_pixels = (tensor_diff_pixels * tensor_diff_pixels_relative_previous).to(device)
+
+        tensor_areaOfInterest = self.get_area_of_interest(tensor_final_diff_pixels, detected_objects).to(device)
         tensor_filteredByInterest = (tensor_diff_pixels * tensor_areaOfInterest).to(device)
 
-        tensor_minPixelStrength = int(tensor_filteredByInterest.max() * 0.7)
+        #tensor_minPixelStrength = int(tensor_filteredByInterest.max() * 0.7)
+
+        #tensor_diff_pixels_dsa = tensor_filteredByInterest.clone().to(device)
+        #tensor_diff_pixels_dsa[tensor_diff_pixels_dsa < tensor_minPixelStrength] = 0
+
         tensor_diff_pixels_dsa = tensor_filteredByInterest.clone().to(device)
-        tensor_diff_pixels_dsa[tensor_diff_pixels_dsa < tensor_minPixelStrength] = 0
+        if (last_ball_position[0] != 0 and last_ball_position[1] != 0):
+            tensor_areaofBall = torch.zeros_like(tensor_filteredByInterest).to(device)
+            tensor_areaofBall[last_ball_position[0] - 200:last_ball_position[0] + 200, last_ball_position[1] - 200:last_ball_position[1] + 200] = 1
+            tensor_diff_pixels_dsa = (tensor_filteredByInterest * tensor_areaofBall).to(device)
+
 
         tensor_masked = tensor_diff_pixels_dsa.clone().to(device)
 
         for i in range(len(detected_objects.object_list)):
-            mask = self.get_mask(i, tensor_diff_pixels_dsa, detected_objects).to(device)
+            mask = self.get_mask(i, tensor_diff_pixels_dsa, detected_objects, 15).to(device)
             tensor_masked[mask == 1.0] = 0.0
 
         tensor_yellow_areas = self.find_yellow_areas(tensor_original_picture_gpu, device).to(device)
@@ -396,7 +418,7 @@ class BallDetectionPytorch:
         if camera == 'left':
             torch.save(self.median_background_l, path +'_l.pt')
         elif camera == 'right':
-            torch.save(self.median_background_l, path +'_r.pt')
+            torch.save(self.median_background_r, path +'_r.pt')
         else:
             raise Exception('camera must be either left or right')
 
@@ -417,6 +439,84 @@ class BallDetectionPytorch:
             return self.median_background_r
         else:
             raise Exception('camera must be either left or right')
+
+    def triangulation(self, pt1, pt2):
+
+        """
+        Trianguliert einen Punkt aus zwei Ansichten.
+
+        :param K: Die Kameramatrix.
+        :param R: Die Rotationsmatrix, die die Ausrichtung der zweiten Kamera relativ zur ersten beschreibt.
+        :param t: Der Translationsvektor, der die Position der zweiten Kamera relativ zur ersten beschreibt.
+        :param pt1: Der Punkt im ersten Bild (in Pixelkoordinaten).
+        :param pt2: Der Punkt im zweiten Bild (in Pixelkoordinaten).
+        :return: Die 3D-Koordinaten des Punktes im Weltkoordinatensystem.
+        """
+
+        zed = sl.Camera()
+
+        init_params = sl.InitParameters()
+        init_params.set_from_svo_file(self.svo_path)
+        init_params.depth_mode = sl.DEPTH_MODE.ULTRA
+        init_params.coordinate_units = sl.UNIT.METER
+        init_params.depth_maximum_distance = 40
+        init_params.depth_minimum_distance = 1
+        init_params.sdk_verbose = True
+
+        zed.open(init_params)
+
+        calib_params = zed.get_camera_information().camera_configuration.calibration_parameters
+        intrinsics = calib_params.left_cam
+        K = np.array([[intrinsics.fx, 0, intrinsics.cx],
+                      [0, intrinsics.fy, intrinsics.cy],
+                      [0, 0, 1]])
+
+        R = calib_params.left_cam.disto.reshape(3,4)
+                    #[x, y, z]
+        #t = calib_params.T
+
+
+        # Erstelle Projektionsmatrizen
+        P1 = K @ np.hstack((np.eye(3), np.zeros((3, 1))))
+        #P2 = K @ np.hstack((R, t))
+        P2 = K@ R
+
+        print(P1)
+        print(P2)
+
+        pts1 = np.array([[pt1[0]], [pt1[1]]])
+        pts2 = np.array([[pt2[0]], [pt2[1]]])
+
+        print(pts1)
+        print(pts2)
+
+        # Trianguliere den Punkt
+        point_3d_hom = cv2.triangulatePoints(projMatr1 = P1, projMatr2 = P2, projPoints1 = pts1, projPoints2 = pts2)
+
+        # Konvertiere zurück in nicht-homogene Koordinaten
+        point_3d = point_3d_hom[:3] / point_3d_hom[3]
+
+        zed.close()
+        return point_3d.ravel()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
