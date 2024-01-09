@@ -15,6 +15,7 @@ class BallDetectionPytorch:
         self.svo_path = svo_path
         self.median_background_l = torch.tensor([]).to(device)
         self.median_background_r = torch.tensor([]).to(device)
+        self.ball_positions = []
 
     def get_ball_by_frame(self, frameFrom, frameTo, camera = 'left', return_video = False):
 
@@ -92,13 +93,14 @@ class BallDetectionPytorch:
         video = torch.zeros((1080, 1920, 3, frameTo - frameFrom))
         zed.set_svo_position(frameFrom)
         current_depth_frame = sl.Mat()
+        pointcloud = sl.Mat()
+        list_of_ball_depths = []
 
         for frame in tqdm(range(frameFrom, frameTo)):
             if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
                 # Get Images
                 zed.retrieve_image(current_frame, camera_lens)
                 zed.retrieve_objects(detected_objects, detection_parameters_rt)
-                zed.retrieve_measure(current_depth_frame, sl.MEASURE.DEPTH)
 
 
                 # Get Arrays
@@ -113,10 +115,10 @@ class BallDetectionPytorch:
                 tensor_tennis_ball_pos = self.detect_tennis_ball(tensor_moving, detected_objects, tensor_current_frame_data, last_ball_position, last_picture).to(device)
                 last_ball_position = tensor_tennis_ball_pos.clone()
                 last_picture = tensor_current_frame_data.clone()
-                if not return_video:
-                   list_of_ball_positions.append(tensor_tennis_ball_pos)
 
-                else:
+                list_of_ball_positions.append( [frame, tensor_tennis_ball_pos[0].cpu().item(), tensor_tennis_ball_pos[1].cpu().item()] )
+
+                if return_video:
                     tensor_tennis_ball_bb = self.draw_bb(tensor_current_frame_data, tensor_tennis_ball_pos)
                     tensor_frame_with_bb = tensor_tennis_ball_bb.clone()
                     tensor_mask = tensor_tennis_ball_bb != 255
@@ -125,13 +127,14 @@ class BallDetectionPytorch:
             else:
                 print('Error')
 
+        zed.close()
+
+        self.ball_positions = list_of_ball_positions
         if return_video:
             self.make_mp4(video, camera)
             return video
-        else:
-            result_list = torch.cat(list_of_ball_positions, dim=0)
-            result_list = torch.reshape(result_list, (int(result_list.shape[0]/2), 2))
-            return result_list
+
+        return list_of_ball_positions
 
     @staticmethod
     def make_mp4(video, camera, bildrate = 20, auflösung = (1920, 1080)):
