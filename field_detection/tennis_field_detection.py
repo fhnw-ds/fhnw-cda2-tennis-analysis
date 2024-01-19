@@ -126,6 +126,7 @@ if __name__ == '__main__':
     init_params.sdk_verbose = True
 
     zed.open(init_params)
+    offset_frames = 400
     calibration_frames = 10
     skip_frames = 30
     runtime_parameters = sl.RuntimeParameters()
@@ -133,6 +134,7 @@ if __name__ == '__main__':
     temp_image_right = sl.Mat()
     color_array_l = np.zeros((1080, 1920, 3, calibration_frames))
     color_array_r = np.zeros((1080, 1920, 3, calibration_frames))
+    zed.set_svo_position(offset_frames)
     for i in range(calibration_frames * skip_frames):
         zed.grab(runtime_parameters)
         if i % skip_frames != 0:
