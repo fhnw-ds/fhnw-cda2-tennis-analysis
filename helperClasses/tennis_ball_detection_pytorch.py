@@ -1,5 +1,7 @@
 import os
 from datetime import datetime
+
+import pandas as pd
 import pyzed.sl as sl
 import numpy as np
 from tqdm import tqdm
@@ -18,7 +20,7 @@ class BallDetectionPytorch:
         self.svo_path = svo_path
         self.median_background_l = torch.tensor([]).to(device)
         self.median_background_r = torch.tensor([]).to(device)
-        self.ball_positions = []
+        self.ball_positions = np.array([])
 
     def get_ball_by_frame(self, frameFrom, frameTo, camera = 'left', return_video = False):
 
@@ -92,7 +94,7 @@ class BallDetectionPytorch:
         last_picture_right = torch.zeros((1080, 1920, 3)).to(device)
 
 
-        list_of_ball_positions = []
+        list_of_ball_positions = np.empty((0, 4))
         video = torch.zeros((1080, 1920, 3, frameTo - frameFrom))
         zed.set_svo_position(frameFrom)
 
@@ -128,8 +130,11 @@ class BallDetectionPytorch:
 
                 tuple_ball_pos_left = (tensor_tennis_ball_pos_left[0].cpu().item(), tensor_tennis_ball_pos_left[1].cpu().item())
                 tuple_ball_pos_right = (tensor_tennis_ball_pos_right[0].cpu().item(), tensor_tennis_ball_pos_right[1].cpu().item())
+                ballpos = self.triangulation(tuple_ball_pos_left, tuple_ball_pos_right, map_left_x, map_left_y, map_right_x,map_right_y, camera_matrix_left, camera_matrix_right)
 
-                list_of_ball_positions.append(self.triangulation(tuple_ball_pos_left, tuple_ball_pos_right, map_left_y, map_right_y, cameraMatrix_left, cameraMatrix_right))
+
+                new_data = np.array([frame, ballpos[0][0], ballpos[1][0], ballpos[2][0]])
+                list_of_ball_positions = np.vstack((list_of_ball_positions, new_data))
 
                 if return_video:
                     tensor_tennis_ball_bb = self.draw_bb(tensor_current_frame_data_left, tensor_tennis_ball_pos_left)
@@ -138,6 +143,7 @@ class BallDetectionPytorch:
                     tensor_frame_with_bb[tensor_mask] = tensor_current_frame_data_left[tensor_mask]
                     video[:, :, :, frame - frameFrom] = tensor_frame_with_bb
             else:
+                print(zed.grab(runtime_parameters))
                 print('Error')
 
         zed.close()
@@ -414,7 +420,6 @@ class BallDetectionPytorch:
                 zed.retrieve_image(temp_image, camera_lens)
                 current_frame = temp_image.get_data()[:, :, :3]
                 color_array[:, :, :, i // skip_frames] = torch.from_numpy(current_frame)
-            raise Exception('camera not found')
         # get median depth
         median_depth = color_array.nanmedian(3).values
         if camera == 'left':
@@ -455,7 +460,7 @@ class BallDetectionPytorch:
         else:
             raise Exception('camera must be either left or right')
 
-    def triangulation(self, pt_l, pt_r, map_left_y, map_right_y, camera_matrix_left, camera_matrix_right):
+    def triangulation(self, pt_l, pt_r, map_left_x, map_left_y, map_right_x, map_right_y, camera_matrix_left, camera_matrix_right):
 
         """
         Trianguliert einen Punkt aus zwei Ansichten.
