@@ -1,8 +1,13 @@
+import os
 from datetime import datetime
+
+import pandas as pd
 import pyzed.sl as sl
 import numpy as np
 from tqdm import tqdm
 import cv2
+import configparser
+import os
 from numpy.lib import stride_tricks
 import matplotlib.pyplot as plt
 import torch
@@ -15,6 +20,7 @@ class BallDetectionPytorch:
         self.svo_path = svo_path
         self.median_background_l = torch.tensor([]).to(device)
         self.median_background_r = torch.tensor([]).to(device)
+        self.ball_positions = np.array([])
 
     def get_ball_by_frame(self, frameFrom, frameTo, camera = 'left', return_video = False):
 
@@ -38,15 +44,10 @@ class BallDetectionPytorch:
 
 
 
-        camera_lens = sl.VIEW
-        if camera == 'left':
-            camera_lens = sl.VIEW.LEFT
-            tensor_median_background = self.median_background_l
-        elif camera == 'right':
-            camera_lens = sl.VIEW.RIGHT
-            tensor_median_background = self.median_background_r
-        else:
-            raise Exception('camera must be either left or right')
+        #calculate median background
+
+        self.load_background('left')
+        self.load_background('right')
 
         zed = sl.Camera()
 
@@ -61,7 +62,9 @@ class BallDetectionPytorch:
 
         zed.open(init_params)
 
-        current_frame = sl.Mat()
+
+        current_frame_right = sl.Mat()
+        current_frame_left = sl.Mat()
 
         # init detection parameters
         detection_parameters = sl.ObjectDetectionParameters()
@@ -85,44 +88,72 @@ class BallDetectionPytorch:
         detected_objects = sl.Objects()
         runtime_parameters = sl.RuntimeParameters()
 
-        list_of_ball_positions = []
+        last_ball_position_left = torch.tensor([0, 0]).to(device)
+        last_picture_left = torch.zeros((1080, 1920, 3)).to(device)
+        last_ball_position_right = torch.tensor([0, 0]).to(device)
+        last_picture_right = torch.zeros((1080, 1920, 3)).to(device)
+
+
+        list_of_ball_positions = np.empty((0, 4))
         video = torch.zeros((1080, 1920, 3, frameTo - frameFrom))
         zed.set_svo_position(frameFrom)
+
+        camera_matrix_left, camera_matrix_right, map_left_x, map_left_y, map_right_x, map_right_y = self.init_calibration(calibration_file='../../SN35071549.conf', image_size= zed.get_camera_information().camera_configuration.resolution)
+
 
         for frame in tqdm(range(frameFrom, frameTo)):
             if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
                 # Get Images
-                zed.retrieve_image(current_frame, camera_lens)
+                zed.retrieve_image(current_frame_left, sl.VIEW.LEFT)
+                zed.retrieve_image(current_frame_right, sl.VIEW.RIGHT)
                 zed.retrieve_objects(detected_objects, detection_parameters_rt)
 
                 # Get Arrays
-                current_frame_data = current_frame.get_data()[:, :, :3]
-                tensor_current_frame_data = torch.from_numpy(current_frame_data).to(device)
+                current_frame_data_left = current_frame_left.get_data()[:, :, :3]
+                tensor_current_frame_data_left = torch.from_numpy(current_frame_data_left).to(device)
+
+                current_frame_data_right = current_frame_right.get_data()[:, :, :3]
+                tensor_current_frame_data_right = torch.from_numpy(current_frame_data_right).to(device)
 
                 # Get Moving Pixels
-                tensor_moving = (tensor_current_frame_data - tensor_median_background).to(device)
-
+                tensor_moving_left = (tensor_current_frame_data_left - self.median_background_l).to(device)
+                tensor_moving_right = (tensor_current_frame_data_right - self.median_background_r).to(device)
 
                 # Get Tennis Ball Position
-                tensor_tennis_ball_pos = self.detect_tennis_ball(tensor_moving, detected_objects, tensor_current_frame_data).to(device)
+                tensor_tennis_ball_pos_left = self.detect_tennis_ball(tensor_moving_left, detected_objects, tensor_current_frame_data_left, last_ball_position_left, last_picture_left).to(device)
+                last_ball_position_left = tensor_tennis_ball_pos_left.clone()
+                last_picture_left = tensor_current_frame_data_left.clone()
 
-                if not return_video:
-                   list_of_ball_positions.append(tensor_tennis_ball_pos)
+                tensor_tennis_ball_pos_right = self.detect_tennis_ball(tensor_moving_right, detected_objects, tensor_current_frame_data_right, last_ball_position_right, last_picture_right).to(device)
+                last_ball_position_right = tensor_tennis_ball_pos_right.clone()
+                last_picture_right = tensor_current_frame_data_right.clone()
 
-                else:
-                    tensor_tennis_ball_bb = self.draw_bb(tensor_current_frame_data, tensor_tennis_ball_pos)
+                tuple_ball_pos_left = (tensor_tennis_ball_pos_left[0].cpu().item(), tensor_tennis_ball_pos_left[1].cpu().item())
+                tuple_ball_pos_right = (tensor_tennis_ball_pos_right[0].cpu().item(), tensor_tennis_ball_pos_right[1].cpu().item())
+                ballpos = self.triangulation(tuple_ball_pos_left, tuple_ball_pos_right, map_left_x, map_left_y, map_right_x,map_right_y, camera_matrix_left, camera_matrix_right)
+
+
+                new_data = np.array([frame, ballpos[0][0], ballpos[1][0], ballpos[2][0]])
+                list_of_ball_positions = np.vstack((list_of_ball_positions, new_data))
+
+                if return_video:
+                    tensor_tennis_ball_bb = self.draw_bb(tensor_current_frame_data_left, tensor_tennis_ball_pos_left)
                     tensor_frame_with_bb = tensor_tennis_ball_bb.clone()
                     tensor_mask = tensor_tennis_ball_bb != 255
-                    tensor_frame_with_bb[tensor_mask] = tensor_current_frame_data[tensor_mask]
+                    tensor_frame_with_bb[tensor_mask] = tensor_current_frame_data_left[tensor_mask]
                     video[:, :, :, frame - frameFrom] = tensor_frame_with_bb
+            else:
+                print(zed.grab(runtime_parameters))
+                print('Error')
 
+        zed.close()
+
+        self.ball_positions = list_of_ball_positions
         if return_video:
             self.make_mp4(video, camera)
             return video
-        else:
-            result_list = torch.cat(list_of_ball_positions, dim=0)
-            result_list = torch.reshape(result_list, (int(result_list.shape[0]/2), 2))
-            return result_list
+
+        return list_of_ball_positions
 
     @staticmethod
     def make_mp4(video, camera, bildrate = 20, auflösung = (1920, 1080)):
@@ -136,6 +167,7 @@ class BallDetectionPytorch:
         :return: The converted video.
         """
         video_numpy = video.cpu().numpy()
+        video_numpy = video_numpy.astype(np.uint8)
         datestring = datetime.now().strftime("%Y-%m-%d-%H-%M")
         filename = f'renderedVideo-{datestring}_{camera}.mp4'
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec
@@ -143,7 +175,7 @@ class BallDetectionPytorch:
 
         # Bilder zum Video hinzufügen
         for bild in tqdm(range(video_numpy.shape[3])):
-            video_komplett.write(video_numpy[:, :, :, bild].astype(np.uint8))
+            video_komplett.write(video_numpy[:, :, :, bild])
 
         # Video speichern
         video_komplett.release()
@@ -244,7 +276,8 @@ class BallDetectionPytorch:
         windows = tensor_image.unfold(0, window_height, 1).unfold(1, window_width, 1)
 
         # Berechnung der Summe in jedem Fenster
-        tensor_window_sums = windows.sum(dim=[2, 3])
+        windows = windows.float()
+        tensor_window_sums = windows.mean(dim=[2, 3])
 
         return tensor_window_sums
 
@@ -274,7 +307,7 @@ class BallDetectionPytorch:
 
         return mask
 
-    def detect_tennis_ball(self, tensor_moving_pixels, detected_objects, tensor_original_picture):
+    def detect_tennis_ball(self, tensor_moving_pixels, detected_objects, tensor_original_picture, last_ball_position, previous_picture):
         """
         Detects the tennis ball in the image.
 
@@ -286,22 +319,33 @@ class BallDetectionPytorch:
         """
         tensor_original_picture_gpu = tensor_original_picture.to(device)
         tensor_moving_pixels_gpu = tensor_moving_pixels.to(device)
+        tensor_moving_pixels_relative_previous = (tensor_original_picture_gpu - previous_picture).to(device)
 
-
+        tensor_diff_pixels_relative_previous = torch.square(tensor_moving_pixels_relative_previous.type(torch.uint8)).sum(dim=2).to(device)
         tensor_diff_pixels = torch.square(tensor_moving_pixels_gpu.type(torch.uint8)).sum(dim=2).to(device)
         #diff_pixels = np.square(moving_pixels.astype(np.uint8)).sum(axis=2)
 
-        tensor_areaOfInterest = self.get_area_of_interest(tensor_diff_pixels, detected_objects).to(device)
+        tensor_final_diff_pixels = (tensor_diff_pixels * tensor_diff_pixels_relative_previous).to(device)
+
+        tensor_areaOfInterest = self.get_area_of_interest(tensor_final_diff_pixels, detected_objects).to(device)
         tensor_filteredByInterest = (tensor_diff_pixels * tensor_areaOfInterest).to(device)
 
-        tensor_minPixelStrength = int(tensor_filteredByInterest.max() * 0.7)
+        #tensor_minPixelStrength = int(tensor_filteredByInterest.max() * 0.7)
+
+        #tensor_diff_pixels_dsa = tensor_filteredByInterest.clone().to(device)
+        #tensor_diff_pixels_dsa[tensor_diff_pixels_dsa < tensor_minPixelStrength] = 0
+
         tensor_diff_pixels_dsa = tensor_filteredByInterest.clone().to(device)
-        tensor_diff_pixels_dsa[tensor_diff_pixels_dsa < tensor_minPixelStrength] = 0
+        if (last_ball_position[0] != 0 and last_ball_position[1] != 0):
+            tensor_areaofBall = torch.zeros_like(tensor_filteredByInterest).to(device)
+            tensor_areaofBall[last_ball_position[0] - 200:last_ball_position[0] + 200, last_ball_position[1] - 200:last_ball_position[1] + 200] = 1
+            tensor_diff_pixels_dsa = (tensor_filteredByInterest * tensor_areaofBall).to(device)
+
 
         tensor_masked = tensor_diff_pixels_dsa.clone().to(device)
 
         for i in range(len(detected_objects.object_list)):
-            mask = self.get_mask(i, tensor_diff_pixels_dsa, detected_objects).to(device)
+            mask = self.get_mask(i, tensor_diff_pixels_dsa, detected_objects, 15).to(device)
             tensor_masked[mask == 1.0] = 0.0
 
         tensor_yellow_areas = self.find_yellow_areas(tensor_original_picture_gpu, device).to(device)
@@ -352,7 +396,6 @@ class BallDetectionPytorch:
             raise Exception('camera must be either left or right')
 
 
-        svo_path = svo_path
         zed = sl.Camera()
 
         # init parameters
@@ -377,7 +420,6 @@ class BallDetectionPytorch:
                 zed.retrieve_image(temp_image, camera_lens)
                 current_frame = temp_image.get_data()[:, :, :3]
                 color_array[:, :, :, i // skip_frames] = torch.from_numpy(current_frame)
-
         # get median depth
         median_depth = color_array.nanmedian(3).values
         if camera == 'left':
@@ -396,7 +438,7 @@ class BallDetectionPytorch:
         if camera == 'left':
             torch.save(self.median_background_l, path +'_l.pt')
         elif camera == 'right':
-            torch.save(self.median_background_l, path +'_r.pt')
+            torch.save(self.median_background_r, path +'_r.pt')
         else:
             raise Exception('camera must be either left or right')
 
@@ -417,6 +459,155 @@ class BallDetectionPytorch:
             return self.median_background_r
         else:
             raise Exception('camera must be either left or right')
+
+    def triangulation(self, pt_l, pt_r, map_left_x, map_left_y, map_right_x, map_right_y, camera_matrix_left, camera_matrix_right):
+
+        """
+        Trianguliert einen Punkt aus zwei Ansichten.
+
+        :param K: Die Kameramatrix.
+        :param R: Die Rotationsmatrix, die die Ausrichtung der zweiten Kamera relativ zur ersten beschreibt.
+        :param t: Der Translationsvektor, der die Position der zweiten Kamera relativ zur ersten beschreibt.
+        :param pt1: Der Punkt im ersten Bild (in Pixelkoordinaten).
+        :param pt2: Der Punkt im zweiten Bild (in Pixelkoordinaten).
+        :return: Die 3D-Koordinaten des Punktes im Weltkoordinatensystem.
+        """
+
+        pt_l_undist = np.array([map_left_y[pt_l], map_left_x[pt_l]])
+        pt_r_undist = np.array([map_right_y[pt_r], map_right_x[pt_r]])
+        point_4d_hom = cv2.triangulatePoints(camera_matrix_left, camera_matrix_right, pt_l_undist, pt_r_undist)
+        point_4d = point_4d_hom / point_4d_hom[3]
+
+        return point_4d
+
+
+    def init_calibration(self, calibration_file, image_size):
+
+        cameraMarix_left = cameraMatrix_right = map_left_y = map_left_x = map_right_y = map_right_x = np.array([])
+
+        config = configparser.ConfigParser()
+        config.read(calibration_file)
+
+        check_data = True
+        resolution_str = ''
+        if image_size.width == 2208:
+            resolution_str = '2K'
+        elif image_size.width == 1920:
+            resolution_str = 'FHD'
+        elif image_size.width == 1280:
+            resolution_str = 'HD'
+        elif image_size.width == 672:
+            resolution_str = 'VGA'
+        else:
+            resolution_str = 'HD'
+            check_data = False
+
+        T_ = np.array([-float(config['STEREO']['Baseline'] if 'Baseline' in config['STEREO'] else 0),
+                       float(config['STEREO']['TY_' + resolution_str] if 'TY_' + resolution_str in config[
+                           'STEREO'] else 0),
+                       float(config['STEREO']['TZ_' + resolution_str] if 'TZ_' + resolution_str in config[
+                           'STEREO'] else 0)])
+
+        left_cam_cx = float(
+            config['LEFT_CAM_' + resolution_str]['cx'] if 'cx' in config['LEFT_CAM_' + resolution_str] else 0)
+        left_cam_cy = float(
+            config['LEFT_CAM_' + resolution_str]['cy'] if 'cy' in config['LEFT_CAM_' + resolution_str] else 0)
+        left_cam_fx = float(
+            config['LEFT_CAM_' + resolution_str]['fx'] if 'fx' in config['LEFT_CAM_' + resolution_str] else 0)
+        left_cam_fy = float(
+            config['LEFT_CAM_' + resolution_str]['fy'] if 'fy' in config['LEFT_CAM_' + resolution_str] else 0)
+        left_cam_k1 = float(
+            config['LEFT_CAM_' + resolution_str]['k1'] if 'k1' in config['LEFT_CAM_' + resolution_str] else 0)
+        left_cam_k2 = float(
+            config['LEFT_CAM_' + resolution_str]['k2'] if 'k2' in config['LEFT_CAM_' + resolution_str] else 0)
+        left_cam_p1 = float(
+            config['LEFT_CAM_' + resolution_str]['p1'] if 'p1' in config['LEFT_CAM_' + resolution_str] else 0)
+        left_cam_p2 = float(
+            config['LEFT_CAM_' + resolution_str]['p2'] if 'p2' in config['LEFT_CAM_' + resolution_str] else 0)
+        left_cam_p3 = float(
+            config['LEFT_CAM_' + resolution_str]['p3'] if 'p3' in config['LEFT_CAM_' + resolution_str] else 0)
+        left_cam_k3 = float(
+            config['LEFT_CAM_' + resolution_str]['k3'] if 'k3' in config['LEFT_CAM_' + resolution_str] else 0)
+
+        right_cam_cx = float(
+            config['RIGHT_CAM_' + resolution_str]['cx'] if 'cx' in config['RIGHT_CAM_' + resolution_str] else 0)
+        right_cam_cy = float(
+            config['RIGHT_CAM_' + resolution_str]['cy'] if 'cy' in config['RIGHT_CAM_' + resolution_str] else 0)
+        right_cam_fx = float(
+            config['RIGHT_CAM_' + resolution_str]['fx'] if 'fx' in config['RIGHT_CAM_' + resolution_str] else 0)
+        right_cam_fy = float(
+            config['RIGHT_CAM_' + resolution_str]['fy'] if 'fy' in config['RIGHT_CAM_' + resolution_str] else 0)
+        right_cam_k1 = float(
+            config['RIGHT_CAM_' + resolution_str]['k1'] if 'k1' in config['RIGHT_CAM_' + resolution_str] else 0)
+        right_cam_k2 = float(
+            config['RIGHT_CAM_' + resolution_str]['k2'] if 'k2' in config['RIGHT_CAM_' + resolution_str] else 0)
+        right_cam_p1 = float(
+            config['RIGHT_CAM_' + resolution_str]['p1'] if 'p1' in config['RIGHT_CAM_' + resolution_str] else 0)
+        right_cam_p2 = float(
+            config['RIGHT_CAM_' + resolution_str]['p2'] if 'p2' in config['RIGHT_CAM_' + resolution_str] else 0)
+        right_cam_p3 = float(
+            config['RIGHT_CAM_' + resolution_str]['p3'] if 'p3' in config['RIGHT_CAM_' + resolution_str] else 0)
+        right_cam_k3 = float(
+            config['RIGHT_CAM_' + resolution_str]['k3'] if 'k3' in config['RIGHT_CAM_' + resolution_str] else 0)
+
+        R_zed = np.array(
+            [float(config['STEREO']['RX_' + resolution_str] if 'RX_' + resolution_str in config['STEREO'] else 0),
+             float(config['STEREO']['CV_' + resolution_str] if 'CV_' + resolution_str in config['STEREO'] else 0),
+             float(config['STEREO']['RZ_' + resolution_str] if 'RZ_' + resolution_str in config['STEREO'] else 0)])
+
+        R, _ = cv2.Rodrigues(R_zed)
+        cameraMatrix_left = np.array([[left_cam_fx, 0, left_cam_cx],
+                                      [0, left_cam_fy, left_cam_cy],
+                                      [0, 0, 1]])
+
+        cameraMatrix_right = np.array([[right_cam_fx, 0, right_cam_cx],
+                                       [0, right_cam_fy, right_cam_cy],
+                                       [0, 0, 1]])
+
+        distCoeffs_left = np.array([[left_cam_k1], [left_cam_k2], [left_cam_p1], [left_cam_p2], [left_cam_k3]])
+
+        distCoeffs_right = np.array([[right_cam_k1], [right_cam_k2], [right_cam_p1], [right_cam_p2], [right_cam_k3]])
+
+        T = np.array([[T_[0]], [T_[1]], [T_[2]]])
+        R1 = R2 = P1 = P2 = np.array([])
+
+        R1, R2, P1, P2 = cv2.stereoRectify(cameraMatrix1=cameraMatrix_left,
+                                           cameraMatrix2=cameraMatrix_right,
+                                           distCoeffs1=distCoeffs_left,
+                                           distCoeffs2=distCoeffs_right,
+                                           R=R, T=T,
+                                           flags=cv2.CALIB_ZERO_DISPARITY,
+                                           alpha=0,
+                                           imageSize=(image_size.width, image_size.height),
+                                           newImageSize=(image_size.width, image_size.height))[0:4]
+
+        map_left_x, map_left_y = cv2.initUndistortRectifyMap(cameraMatrix_left, distCoeffs_left, R1, P1,
+                                                             (image_size.width, image_size.height), cv2.CV_32FC1)
+        map_right_x, map_right_y = cv2.initUndistortRectifyMap(cameraMatrix_right, distCoeffs_right, R2, P2,
+                                                               (image_size.width, image_size.height), cv2.CV_32FC1)
+
+        cameraMatrix_left = P1
+        cameraMatrix_right = P2
+
+        return cameraMatrix_left, cameraMatrix_right, map_left_x, map_left_y, map_right_x, map_right_y
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
